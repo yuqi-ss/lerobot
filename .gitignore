@@ -157,6 +157,9 @@ nautilus/*.yaml
 sbatch*.sh
 
 ### Miscellaneous ###
+# GitHub Actions workflows (not tracked; avoids PAT workflow scope on push)
+.github/workflows/
+
 # W&B
 wandb/
 

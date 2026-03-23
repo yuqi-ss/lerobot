@@ -38,11 +38,29 @@ python src/lerobot/scripts/convert_dataset_v21_to_v30.py \
     --repo-id=lerobot/pusht \
     --root=/path/to/local/dataset/directory \
     --push-to-hub=false
+```
+
+Keep the v2.1 dataset unchanged and write v3.0 elsewhere (requires `--root`):
+```bash
+python src/lerobot/scripts/convert_dataset_v21_to_v30.py \
+    --repo-id=myuser/my_dataset \
+    --root=/path/to/v2.1/dataset \
+    --output-root=/path/to/v3.0/output \
+    --push-to-hub false
+```
+
+Only convert a subset of v2.1 **source** chunks (``data/chunk-NNN``, ``videos/chunk-NNN``), e.g. chunks 0–10 inclusive:
+```bash
+python src/lerobot/scripts/convert_dataset_v21_to_v30.py \
+    --repo-id=myuser/my_dataset \
+    --root=/path/to/v2.1/dataset \
+    --output-root=/path/to/v3.0/partial \
+    --chunk-range 0 10 \
+    --push-to-hub false
+```
 
 N.B. Path semantics (v2): --root is the exact dataset folder containing
 meta/, data/, videos/. When omitted, defaults to $HF_LEROBOT_HOME/{repo_id}.
-```
-
 """
 
 import argparse
@@ -91,6 +109,40 @@ from lerobot.utils.utils import init_logging
 
 V21 = "v2.1"
 V30 = "v3.0"
+
+
+def parse_episode_index_from_stem(path: Path) -> int:
+    """Parse global episode index from ``episode_XXXXXX`` file stem (parquet or mp4)."""
+    stem = path.stem
+    if not stem.startswith("episode_"):
+        raise ValueError(f"Expected episode_XXXXXX.*, got {path.name}")
+    return int(stem.split("_", 1)[1])
+
+
+def parse_data_chunk_index(path: Path) -> int:
+    """Chunk index from ``.../data/chunk-NNN/episode_....parquet``."""
+    name = path.parent.name
+    if not name.startswith("chunk-"):
+        raise ValueError(f"Expected .../data/chunk-NNN/..., got {path}")
+    return int(name.removeprefix("chunk-"))
+
+
+def parse_video_chunk_index(path: Path) -> int:
+    """Chunk index from ``.../videos/chunk-NNN/<video_key>/episode_....mp4``."""
+    name = path.parent.parent.name
+    if not name.startswith("chunk-"):
+        raise ValueError(f"Expected .../videos/chunk-NNN/<camera>/..., got {path}")
+    return int(name.removeprefix("chunk-"))
+
+
+def patch_info_dataset_totals(new_root: Path, total_episodes: int, total_frames: int) -> None:
+    """Update info.json after a subset conversion (e.g. chunk range)."""
+    info = load_info(new_root)
+    info["total_episodes"] = total_episodes
+    info["total_frames"] = total_frames
+    info["splits"] = {"train": f"0:{total_episodes}"}
+    write_info(info, new_root)
+
 
 """
 -------------------------
@@ -202,9 +254,18 @@ def concat_data_files(paths_to_cat, new_root, chunk_idx, file_idx, image_keys):
     concatenated_df.to_parquet(path, index=False, schema=schema)
 
 
-def convert_data(root: Path, new_root: Path, data_file_size_in_mb: int):
+def convert_data(
+    root: Path, new_root: Path, data_file_size_in_mb: int, chunk_range: tuple[int, int] | None = None
+):
     data_dir = root / "data"
-    ep_paths = sorted(data_dir.glob("*/*.parquet"))
+    ep_paths = sorted(
+        data_dir.glob("*/*.parquet"),
+        key=lambda p: (parse_data_chunk_index(p), parse_episode_index_from_stem(p)),
+    )
+    if chunk_range is not None:
+        lo, hi = chunk_range
+        ep_paths = [p for p in ep_paths if lo <= parse_data_chunk_index(p) <= hi]
+        logging.info(f"Chunk range [{lo}, {hi}]: converting {len(ep_paths)} episode parquet files")
 
     image_keys = get_image_keys(root)
 
@@ -216,8 +277,14 @@ def convert_data(root: Path, new_root: Path, data_file_size_in_mb: int):
     episodes_metadata = []
 
     logging.info(f"Converting data files from {len(ep_paths)} episodes")
+    if not ep_paths:
+        raise ValueError(
+            "No parquet files to convert under data/. "
+            "Check v2.1 layout (data/chunk-NNN/episode_*.parquet) and --chunk-range if set."
+        )
 
-    for ep_idx, ep_path in enumerate(tqdm.tqdm(ep_paths, desc="convert data files")):
+    for ep_path in tqdm.tqdm(ep_paths, desc="convert data files"):
+        ep_idx = parse_episode_index_from_stem(ep_path)
         ep_size_in_mb = get_parquet_file_size_in_mb(ep_path)
         ep_num_frames = get_parquet_num_frames(ep_path)
 
@@ -267,7 +334,9 @@ def get_image_keys(root):
     return image_keys
 
 
-def convert_videos(root: Path, new_root: Path, video_file_size_in_mb: int):
+def convert_videos(
+    root: Path, new_root: Path, video_file_size_in_mb: int, chunk_range: tuple[int, int] | None = None
+):
     logging.info(f"Converting videos from {root} to {new_root}")
 
     video_keys = get_video_keys(root)
@@ -278,7 +347,9 @@ def convert_videos(root: Path, new_root: Path, video_file_size_in_mb: int):
 
     eps_metadata_per_cam = []
     for camera in video_keys:
-        eps_metadata = convert_videos_of_camera(root, new_root, camera, video_file_size_in_mb)
+        eps_metadata = convert_videos_of_camera(
+            root, new_root, camera, video_file_size_in_mb, chunk_range=chunk_range
+        )
         eps_metadata_per_cam.append(eps_metadata)
 
     num_eps_per_cam = [len(eps_cam_map) for eps_cam_map in eps_metadata_per_cam]
@@ -291,7 +362,6 @@ def convert_videos(root: Path, new_root: Path, video_file_size_in_mb: int):
     for ep_idx in tqdm.tqdm(range(num_episodes), desc="convert videos"):
         # Sanity check
         ep_ids = [eps_metadata_per_cam[cam_idx][ep_idx]["episode_index"] for cam_idx in range(num_cameras)]
-        ep_ids += [ep_idx]
         if len(set(ep_ids)) != 1:
             raise ValueError(f"All episode indices need to match ({ep_ids}).")
 
@@ -303,12 +373,24 @@ def convert_videos(root: Path, new_root: Path, video_file_size_in_mb: int):
     return episods_metadata
 
 
-def convert_videos_of_camera(root: Path, new_root: Path, video_key: str, video_file_size_in_mb: int):
+def convert_videos_of_camera(
+    root: Path,
+    new_root: Path,
+    video_key: str,
+    video_file_size_in_mb: int,
+    chunk_range: tuple[int, int] | None = None,
+):
     # Access old paths to mp4
     videos_dir = root / "videos"
-    ep_paths = sorted(videos_dir.glob(f"*/{video_key}/*.mp4"))
+    ep_paths = sorted(
+        videos_dir.glob(f"*/{video_key}/*.mp4"),
+        key=lambda p: (parse_video_chunk_index(p), parse_episode_index_from_stem(p)),
+    )
+    if chunk_range is not None:
+        lo, hi = chunk_range
+        ep_paths = [p for p in ep_paths if lo <= parse_video_chunk_index(p) <= hi]
 
-    ep_idx = 0
+    ep_loc = 0
     chunk_idx = 0
     file_idx = 0
     size_in_mb = 0
@@ -317,6 +399,7 @@ def convert_videos_of_camera(root: Path, new_root: Path, video_key: str, video_f
     episodes_metadata = []
 
     for ep_path in tqdm.tqdm(ep_paths, desc=f"convert videos of {video_key}"):
+        global_ep_idx = parse_episode_index_from_stem(ep_path)
         ep_size_in_mb = get_file_size_in_mb(ep_path)
         ep_duration_in_s = get_video_duration_in_s(ep_path)
 
@@ -331,7 +414,7 @@ def convert_videos_of_camera(root: Path, new_root: Path, video_key: str, video_f
 
             # Update episodes metadata for the file we just saved
             for i, _ in enumerate(paths_to_cat):
-                past_ep_idx = ep_idx - len(paths_to_cat) + i
+                past_ep_idx = ep_loc - len(paths_to_cat) + i
                 episodes_metadata[past_ep_idx][f"videos/{video_key}/chunk_index"] = chunk_idx
                 episodes_metadata[past_ep_idx][f"videos/{video_key}/file_index"] = file_idx
 
@@ -343,7 +426,7 @@ def convert_videos_of_camera(root: Path, new_root: Path, video_key: str, video_f
 
         # Add current episode metadata
         ep_metadata = {
-            "episode_index": ep_idx,
+            "episode_index": global_ep_idx,
             f"videos/{video_key}/chunk_index": chunk_idx,  # Will be updated when file is saved
             f"videos/{video_key}/file_index": file_idx,  # Will be updated when file is saved
             f"videos/{video_key}/from_timestamp": duration_in_s,
@@ -355,7 +438,7 @@ def convert_videos_of_camera(root: Path, new_root: Path, video_key: str, video_f
         paths_to_cat.append(ep_path)
         size_in_mb += ep_size_in_mb
         duration_in_s += ep_duration_in_s
-        ep_idx += 1
+        ep_loc += 1
 
     # Write remaining videos if any
     if paths_to_cat:
@@ -367,7 +450,7 @@ def convert_videos_of_camera(root: Path, new_root: Path, video_key: str, video_f
 
         # Update episodes metadata for the final file
         for i, _ in enumerate(paths_to_cat):
-            past_ep_idx = ep_idx - len(paths_to_cat) + i
+            past_ep_idx = ep_loc - len(paths_to_cat) + i
             episodes_metadata[past_ep_idx][f"videos/{video_key}/chunk_index"] = chunk_idx
             episodes_metadata[past_ep_idx][f"videos/{video_key}/file_index"] = file_idx
 
@@ -377,30 +460,43 @@ def convert_videos_of_camera(root: Path, new_root: Path, video_key: str, video_f
 def generate_episode_metadata_dict(
     episodes_legacy_metadata, episodes_metadata, episodes_stats, episodes_videos=None
 ):
-    num_episodes = len(episodes_metadata)
-    episodes_legacy_metadata_vals = list(episodes_legacy_metadata.values())
-    episodes_stats_vals = list(episodes_stats.values())
-    episodes_stats_keys = list(episodes_stats.keys())
+    sorted_ep_ids = sorted(episodes_legacy_metadata.keys())
+    if set(episodes_legacy_metadata.keys()) != set(episodes_stats.keys()):
+        raise ValueError("Legacy episodes and episodes_stats keys do not match.")
+    ep_meta_by_idx = {m["episode_index"]: m for m in episodes_metadata}
+    if set(ep_meta_by_idx.keys()) != set(sorted_ep_ids):
+        raise ValueError(
+            f"Converted episodes {set(ep_meta_by_idx.keys())} do not match "
+            f"filtered legacy/stats {set(sorted_ep_ids)}."
+        )
+    ep_video_by_idx = None
+    if episodes_videos is not None:
+        ep_video_by_idx = {v["episode_index"]: v for v in episodes_videos}
+        if set(ep_video_by_idx.keys()) != set(sorted_ep_ids):
+            raise ValueError(
+                f"Video metadata episodes {set(ep_video_by_idx.keys())} do not match "
+                f"data/stats {set(sorted_ep_ids)}."
+            )
 
-    for i in range(num_episodes):
-        ep_legacy_metadata = episodes_legacy_metadata_vals[i]
-        ep_metadata = episodes_metadata[i]
-        ep_stats = episodes_stats_vals[i]
+    for ep_id in sorted_ep_ids:
+        ep_legacy_metadata = episodes_legacy_metadata[ep_id]
+        ep_metadata = ep_meta_by_idx[ep_id]
+        ep_stats = episodes_stats[ep_id]
 
         ep_ids_set = {
             ep_legacy_metadata["episode_index"],
             ep_metadata["episode_index"],
-            episodes_stats_keys[i],
+            ep_id,
         }
 
-        if episodes_videos is None:
+        if ep_video_by_idx is None:
             ep_video = {}
         else:
-            ep_video = episodes_videos[i]
+            ep_video = ep_video_by_idx[ep_id]
             ep_ids_set.add(ep_video["episode_index"])
 
         if len(ep_ids_set) != 1:
-            raise ValueError(f"Number of episodes is not the same ({ep_ids_set}).")
+            raise ValueError(f"Episode metadata mismatch ({ep_ids_set}).")
 
         ep_dict = {**ep_metadata, **ep_video, **ep_legacy_metadata, **flatten_dict({"stats": ep_stats})}
         ep_dict["meta/episodes/chunk_index"] = 0
@@ -413,6 +509,12 @@ def convert_episodes_metadata(root, new_root, episodes_metadata, episodes_video_
 
     episodes_legacy_metadata = legacy_load_episodes(root)
     episodes_stats = legacy_load_episodes_stats(root)
+
+    converted_episode_ids = {m["episode_index"] for m in episodes_metadata}
+    episodes_legacy_metadata = {
+        k: v for k, v in episodes_legacy_metadata.items() if k in converted_episode_ids
+    }
+    episodes_stats = {k: v for k, v in episodes_stats.items() if k in converted_episode_ids}
 
     num_eps_set = {len(episodes_legacy_metadata), len(episodes_metadata)}
     if episodes_video_metadata is not None:
@@ -457,6 +559,9 @@ def convert_dataset(
     data_file_size_in_mb: int | None = None,
     video_file_size_in_mb: int | None = None,
     root: str | Path | None = None,
+    output_root: str | Path | None = None,
+    overwrite_output: bool = False,
+    chunk_range: tuple[int, int] | None = None,
     push_to_hub: bool = True,
     force_conversion: bool = False,
 ):
@@ -466,7 +571,7 @@ def convert_dataset(
         video_file_size_in_mb = DEFAULT_VIDEO_FILE_SIZE_IN_MB
 
     # First check if the dataset already has a v3.0 version
-    if root is None and not force_conversion:
+    if root is None and not force_conversion and output_root is None and chunk_range is None:
         try:
             print("Trying to download v3.0 version of the dataset from the hub...")
             snapshot_download(repo_id, repo_type="dataset", revision=V30, local_dir=HF_LEROBOT_HOME / repo_id)
@@ -476,22 +581,48 @@ def convert_dataset(
 
     # Set root based on whether local dataset path is provided
     use_local_dataset = False
-    root = HF_LEROBOT_HOME / repo_id if root is None else Path(root)
+    root_arg = root
+    if output_root is not None and root_arg is None:
+        raise ValueError(
+            "--output-root requires --root pointing to your local v2.1 dataset "
+            "(the source tree is left unchanged; v3.0 is written only under --output-root)."
+        )
+    root = HF_LEROBOT_HOME / repo_id if root is None else Path(root).resolve()
+    output_path = Path(output_root).resolve() if output_root is not None else None
+    if output_path is not None and output_path == root:
+        raise ValueError("--output-root must differ from --root so the source dataset stays unchanged.")
+    if output_path is not None and not root.exists():
+        raise FileNotFoundError(
+            f"--root must point to an existing v2.1 dataset when using --output-root: {root}"
+        )
+
     if root.exists():
         validate_local_dataset_version(root)
         use_local_dataset = True
         print(f"Using local dataset at {root}")
 
-    old_root = root.parent / f"{root.name}_old"
-    new_root = root.parent / f"{root.name}_v30"
+    if output_path is not None:
+        new_root = output_path
+        if new_root.exists():
+            if not overwrite_output:
+                raise FileExistsError(
+                    f"Output path already exists: {new_root}. "
+                    "Remove it or pass --overwrite-output."
+                )
+            shutil.rmtree(new_root)
+        new_root.mkdir(parents=True, exist_ok=True)
+        print(f"Writing v3.0 dataset to {new_root} (leaving {root} unchanged).")
+    else:
+        old_root = root.parent / f"{root.name}_old"
+        new_root = root.parent / f"{root.name}_v30"
 
-    # Handle old_root cleanup if both old_root and root exist
-    if old_root.is_dir() and root.is_dir():
-        shutil.rmtree(str(root))
-        shutil.move(str(old_root), str(root))
+        # Handle old_root cleanup if both old_root and root exist
+        if old_root.is_dir() and root.is_dir():
+            shutil.rmtree(str(root))
+            shutil.move(str(old_root), str(root))
 
-    if new_root.is_dir():
-        shutil.rmtree(new_root)
+        if new_root.is_dir():
+            shutil.rmtree(new_root)
 
     if not use_local_dataset:
         snapshot_download(
@@ -503,12 +634,18 @@ def convert_dataset(
 
     convert_info(root, new_root, data_file_size_in_mb, video_file_size_in_mb)
     convert_tasks(root, new_root)
-    episodes_metadata = convert_data(root, new_root, data_file_size_in_mb)
-    episodes_videos_metadata = convert_videos(root, new_root, video_file_size_in_mb)
+    episodes_metadata = convert_data(root, new_root, data_file_size_in_mb, chunk_range=chunk_range)
+    if chunk_range is not None:
+        total_episodes = len(episodes_metadata)
+        total_frames = episodes_metadata[-1]["dataset_to_index"] if episodes_metadata else 0
+        patch_info_dataset_totals(new_root, total_episodes, total_frames)
+    episodes_videos_metadata = convert_videos(root, new_root, video_file_size_in_mb, chunk_range=chunk_range)
     convert_episodes_metadata(root, new_root, episodes_metadata, episodes_videos_metadata)
 
-    shutil.move(str(root), str(old_root))
-    shutil.move(str(new_root), str(root))
+    if output_path is None:
+        old_root = root.parent / f"{root.name}_old"
+        shutil.move(str(root), str(old_root))
+        shutil.move(str(new_root), str(root))
 
     if push_to_hub:
         hub_api = HfApi()
@@ -525,7 +662,9 @@ def convert_dataset(
         )
         hub_api.create_tag(repo_id, tag=CODEBASE_VERSION, revision=branch, repo_type="dataset")
 
-        LeRobotDataset(repo_id).push_to_hub()
+        push_root = str(new_root) if output_path is not None else None
+        ds = LeRobotDataset(repo_id, root=push_root) if push_root else LeRobotDataset(repo_id)
+        ds.push_to_hub(branch=branch)
 
 
 if __name__ == "__main__":
@@ -563,9 +702,20 @@ if __name__ == "__main__":
         help="Local directory to use for downloading/writing the dataset. Defaults to $HF_LEROBOT_HOME/repo_id.",
     )
     parser.add_argument(
+        "--output-root",
+        type=str,
+        default=None,
+        help="If set, write the converted v3.0 dataset here and leave --root unchanged. Requires --root.",
+    )
+    parser.add_argument(
+        "--overwrite-output",
+        action="store_true",
+        help="If --output-root exists, delete it before writing (dangerous).",
+    )
+    parser.add_argument(
         "--push-to-hub",
         type=lambda input: input.lower() == "true",
-        default=True,
+        default=False,
         help="Push the converted dataset to the hub.",
     )
     parser.add_argument(
@@ -573,6 +723,36 @@ if __name__ == "__main__":
         action="store_true",
         help="Force conversion even if the dataset already has a v3.0 version.",
     )
+    parser.add_argument(
+        "--chunk-range",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("START", "END"),
+        help=(
+            "Only convert v2.1 source folders chunk-START through chunk-END (inclusive), "
+            "e.g. `0 10` processes data under chunk-000 … chunk-010. "
+            "Updates info.json totals for this subset."
+        ),
+    )
 
     args = parser.parse_args()
-    convert_dataset(**vars(args))
+    kw = vars(args)
+    cr = kw.pop("chunk_range", None)
+    if cr is not None:
+        lo, hi = cr[0], cr[1]
+        if lo < 0 or hi < 0:
+            raise SystemExit("chunk-range START and END must be non-negative.")
+        if lo > hi:
+            raise SystemExit("chunk-range requires START <= END.")
+        kw["chunk_range"] = (lo, hi)
+    convert_dataset(**kw)
+
+
+
+# python src/lerobot/scripts/convert_dataset_v21_to_v30.py \
+#   --repo-id=database_lerobot_00 \
+#   --root=/home/ss-oss1/data/dataset/egocentric/training_egocentric/retarget_lerobot/database_lerobot_00/ \
+#   --output-root=/home/ss-oss1/data/dataset/egocentric/training_egocentric/retarget_lerobot/database_lerobot_00_v30/ \
+#   --chunk-range 0 0 \
+#   --overwrite-output

@@ -565,7 +565,9 @@ def concatenate_video_files(
 
     input_container.close()
     output_container.close()
-    shutil.move(tmp_output_video_path, output_video_path)
+    # Use copyfile when rename cannot work across devices (/tmp vs data volume) and copy2/copystat
+    # fails on some network/object-store mounts (EPERM on utime).
+    shutil.move(tmp_output_video_path, output_video_path, copy_function=shutil.copyfile)
     Path(tmp_concatenate_path).unlink()
 
 

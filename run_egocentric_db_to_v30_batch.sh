@@ -15,7 +15,7 @@
 {
 
 PREFIX=${1:-"subset"}
-MAX_PARALLEL=${2:-24}
+MAX_PARALLEL=${2:-32}
 
 # ── user config ───────────────────────────────────────────────────────────────
 # Defaults tuned for the host: 384 cores, 4×RTX 5880 Ada, ~42 GB local scratch.
@@ -30,7 +30,17 @@ MAX_PREPARED_IN_FLIGHT=${MAX_PREPARED_IN_FLIGHT:-6}
 PAGE_SIZE=${PAGE_SIZE:-500}
 OVERWRITE=${OVERWRITE:-false}
 REDIRECT_LOG=${REDIRECT_LOG:-true}
+# Multi-machine sharding: each shard processes subsets where i % NUM_SHARDS == SHARD.
+# All shards must use the same NUM_SUBSETS / PARTITION / DST_ROOT (so that subset_NNNN
+# names line up across machines and outputs naturally merge into one DST_ROOT).
+SHARD=${SHARD:-0}
+NUM_SHARDS=${NUM_SHARDS:-1}
 # ─────────────────────────────────────────────────────────────────────────────
+
+if (( SHARD < 0 || SHARD >= NUM_SHARDS )); then
+    echo "Invalid SHARD=${SHARD} (must be in [0, ${NUM_SHARDS}))" >&2
+    exit 2
+fi
 
 PY=/root/miniconda3/envs/ego/bin/python
 [[ -x "${PY}" ]] || PY=python
@@ -83,7 +93,7 @@ print_status() {
     local free_gb
     free_gb=$(df -BG "${WORK_ROOT}" | awk 'NR==2 {gsub("G","",$4); print $4}')
     echo ""
-    echo "── ${DONE_COUNT}/${TOTAL} done | ${running} running | iowait ${_C_IOWAIT}% | disk ${_C_DISK}% | net ↓${_C_RX} ↑${_C_TX} MB/s | scratch_free ${free_gb}G ──"
+    echo "── ${DONE_COUNT}/${MY_SHARD_TOTAL:-$TOTAL} done [shard ${SHARD}/${NUM_SHARDS}] | ${running} running | iowait ${_C_IOWAIT}% | disk ${_C_DISK}% | net ↓${_C_RX} ↑${_C_TX} MB/s | scratch_free ${free_gb}G ──"
     local i prog
     for i in "${!PIDS[@]}"; do
         prog=""
@@ -134,7 +144,8 @@ if (( TOTAL <= 0 )); then
     exit 1
 fi
 
-echo "Got ${#BOUNDARIES[@]} boundaries → ${TOTAL} subsets, max ${MAX_PARALLEL} parallel, vcodec=${VCODEC}"
+MY_SHARD_TOTAL=$(( (TOTAL + NUM_SHARDS - 1 - SHARD) / NUM_SHARDS ))
+echo "Got ${#BOUNDARIES[@]} boundaries → ${TOTAL} subsets total, this shard=${SHARD}/${NUM_SHARDS} owns ${MY_SHARD_TOTAL} subsets, max ${MAX_PARALLEL} parallel, vcodec=${VCODEC}"
 echo "Output dir: ${DST_ROOT}"
 echo "Work dir  : ${WORK_ROOT}"
 echo "Log dir   : ${LOG_DIR}"
@@ -186,6 +197,8 @@ _maybe_print_status() {
 }
 
 for ((i=0; i<TOTAL; i++)); do
+    # Multi-machine sharding: skip subsets owned by other shards.
+    (( i % NUM_SHARDS != SHARD )) && continue
     SUBSET_NAME=$(printf "%s_%04d" "${PREFIX}" "$i")
     OUT_DIR="${DST_ROOT}/${SUBSET_NAME}_v30"
 
@@ -210,7 +223,7 @@ for ((i=0; i<TOTAL; i++)); do
 
     OVERWRITE_FLAG=(); [[ "${OVERWRITE}" == "true" ]] && OVERWRITE_FLAG=(--overwrite)
 
-    echo "[START]  ${SUBSET_NAME}  gpu=${GPU}  range=[${PATH_GTE} , ${PATH_LT}]  (${DONE_COUNT}/${TOTAL} done, ${#PIDS[@]} running)"
+    echo "[START]  ${SUBSET_NAME}  gpu=${GPU}  range=[${PATH_GTE} , ${PATH_LT}]  (${DONE_COUNT}/${MY_SHARD_TOTAL} done in shard ${SHARD}/${NUM_SHARDS}, ${#PIDS[@]} running)"
 
     if [[ "${REDIRECT_LOG}" == "true" ]]; then
         CUDA_VISIBLE_DEVICES="${GPU}" "${PY}" "${SCRIPT}" \
@@ -254,7 +267,7 @@ done
 
 echo ""
 echo "========================================"
-echo "  TOTAL: ${TOTAL}  |  SKIP: ${SKIP_COUNT}  |  FAILED: ${#FAILED[@]}"
+echo "  SHARD ${SHARD}/${NUM_SHARDS}  |  OWNED: ${MY_SHARD_TOTAL}  |  SKIP: ${SKIP_COUNT}  |  FAILED: ${#FAILED[@]}"
 echo "========================================"
 if [ "${#FAILED[@]}" -gt 0 ]; then
     echo "Failed subsets:"

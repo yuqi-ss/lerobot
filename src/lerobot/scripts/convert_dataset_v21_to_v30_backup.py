@@ -64,8 +64,6 @@ meta/, data/, videos/. When omitted, defaults to $HF_LEROBOT_HOME/{repo_id}.
 """
 
 import argparse
-import concurrent.futures
-import json
 import logging
 import shutil
 import time
@@ -566,175 +564,6 @@ def convert_info(root, new_root, data_file_size_in_mb, video_file_size_in_mb):
     write_info(info, new_root)
 
 
-_DONE_MARKER = "_done.json"
-
-
-def _load_cached_result(tmp_root_str: str, chunk_idx: int) -> dict | None:
-    """Return cached worker result if the chunk was fully converted previously."""
-    marker = Path(tmp_root_str) / _DONE_MARKER
-    if not marker.exists():
-        return None
-    try:
-        data = json.loads(marker.read_text())
-        if data.get("source_chunk_idx") == chunk_idx:
-            print(f"[chunk-{chunk_idx:03d}] cached, skipping (finished in {_fmt(data.get('elapsed', 0))})")
-            return data
-    except (json.JSONDecodeError, KeyError):
-        pass
-    return None
-
-
-def _convert_single_chunk_worker(args):
-    """Worker: convert one source chunk to an isolated temp directory."""
-    root_str, tmp_root_str, chunk_idx, data_file_size_in_mb, video_file_size_in_mb = args
-    init_logging()
-    root = Path(root_str)
-    tmp_root = Path(tmp_root_str)
-
-    cached = _load_cached_result(tmp_root_str, chunk_idx)
-    if cached is not None:
-        return cached
-
-    # Clean partial leftovers from a previous interrupted run
-    if tmp_root.exists():
-        shutil.rmtree(tmp_root, ignore_errors=True)
-    tmp_root.mkdir(parents=True, exist_ok=True)
-
-    chunk_range = (chunk_idx, chunk_idx)
-    t0 = time.monotonic()
-    print(f"[chunk-{chunk_idx:03d}] started")
-
-    t1 = time.monotonic()
-    episodes_metadata = convert_data(root, tmp_root, data_file_size_in_mb, chunk_range=chunk_range)
-    print(f"[chunk-{chunk_idx:03d}] data done in {_fmt(time.monotonic() - t1)}")
-
-    t2 = time.monotonic()
-    episodes_videos_metadata = convert_videos(root, tmp_root, video_file_size_in_mb, chunk_range=chunk_range)
-    print(f"[chunk-{chunk_idx:03d}] video done in {_fmt(time.monotonic() - t2)}")
-
-    elapsed = time.monotonic() - t0
-    print(f"[chunk-{chunk_idx:03d}] finished in {_fmt(elapsed)}")
-    result = {
-        "source_chunk_idx": chunk_idx,
-        "tmp_root": tmp_root_str,
-        "episodes_metadata": episodes_metadata,
-        "episodes_videos_metadata": episodes_videos_metadata,
-        "elapsed": elapsed,
-    }
-
-    # Persist result so a re-run can skip this chunk
-    (tmp_root / _DONE_MARKER).write_text(json.dumps(result))
-    return result
-
-
-def _merge_parallel_results(root, new_root, results):
-    """Merge per-chunk worker outputs into the final output directory."""
-    results.sort(key=lambda r: r["source_chunk_idx"])
-    t_merge = time.monotonic()
-
-    all_episodes_metadata = []
-    all_episodes_videos_metadata = []
-    has_videos = False
-
-    global_data_file_counter = 0
-    global_video_file_counters = {}
-    global_frame_offset = 0
-
-    for result in tqdm.tqdm(results, desc="merging parallel results"):
-        tmp_root = Path(result["tmp_root"])
-        eps_meta = result["episodes_metadata"]
-        eps_video_meta = result["episodes_videos_metadata"]
-
-        # Renumber and move data files
-        data_files = sorted(
-            tmp_root.glob("data/chunk-*/file-*.parquet"),
-            key=lambda p: (int(p.parent.name.removeprefix("chunk-")),
-                           int(p.stem.removeprefix("file-"))),
-        )
-        local_to_global_data = {}
-        for df in data_files:
-            local_key = (
-                int(df.parent.name.removeprefix("chunk-")),
-                int(df.stem.removeprefix("file-")),
-            )
-            g_chunk = global_data_file_counter // DEFAULT_CHUNK_SIZE
-            g_file = global_data_file_counter % DEFAULT_CHUNK_SIZE
-            local_to_global_data[local_key] = (g_chunk, g_file)
-
-            dest = new_root / DEFAULT_DATA_PATH.format(chunk_index=g_chunk, file_index=g_file)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(df), str(dest))
-            global_data_file_counter += 1
-
-        for em in eps_meta:
-            new_ck, new_fi = local_to_global_data[
-                (em["data/chunk_index"], em["data/file_index"])
-            ]
-            em["data/chunk_index"] = new_ck
-            em["data/file_index"] = new_fi
-            em["dataset_from_index"] += global_frame_offset
-            em["dataset_to_index"] += global_frame_offset
-
-        if eps_meta:
-            global_frame_offset = eps_meta[-1]["dataset_to_index"]
-        all_episodes_metadata.extend(eps_meta)
-
-        # Renumber and move video files (per camera)
-        if eps_video_meta is not None:
-            has_videos = True
-            cameras = set()
-            for vm in eps_video_meta:
-                for k in vm:
-                    if k.startswith("videos/") and k.endswith("/chunk_index"):
-                        cameras.add(k.removeprefix("videos/").removesuffix("/chunk_index"))
-
-            for camera in sorted(cameras):
-                if camera not in global_video_file_counters:
-                    global_video_file_counters[camera] = 0
-
-                vid_files = sorted(
-                    (tmp_root / "videos" / camera).glob("chunk-*/file-*.mp4"),
-                    key=lambda p: (int(p.parent.name.removeprefix("chunk-")),
-                                   int(p.stem.removeprefix("file-"))),
-                )
-                local_to_global_vid = {}
-                for vf in vid_files:
-                    local_key = (
-                        int(vf.parent.name.removeprefix("chunk-")),
-                        int(vf.stem.removeprefix("file-")),
-                    )
-                    g_ck = global_video_file_counters[camera] // DEFAULT_CHUNK_SIZE
-                    g_fi = global_video_file_counters[camera] % DEFAULT_CHUNK_SIZE
-                    local_to_global_vid[local_key] = (g_ck, g_fi)
-
-                    dest = new_root / DEFAULT_VIDEO_PATH.format(
-                        video_key=camera, chunk_index=g_ck, file_index=g_fi,
-                    )
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(vf), str(dest))
-                    global_video_file_counters[camera] += 1
-
-                ck_key = f"videos/{camera}/chunk_index"
-                fi_key = f"videos/{camera}/file_index"
-                for vm in eps_video_meta:
-                    if ck_key in vm:
-                        new_ck, new_fi = local_to_global_vid[(vm[ck_key], vm[fi_key])]
-                        vm[ck_key] = new_ck
-                        vm[fi_key] = new_fi
-
-            all_episodes_videos_metadata.extend(eps_video_meta)
-
-        shutil.rmtree(tmp_root, ignore_errors=True)
-
-    vids = all_episodes_videos_metadata if has_videos else None
-    convert_episodes_metadata(root, new_root, all_episodes_metadata, vids)
-    total_episodes = len(all_episodes_metadata)
-    total_frames = all_episodes_metadata[-1]["dataset_to_index"] if all_episodes_metadata else 0
-    patch_info_dataset_totals(new_root, total_episodes, total_frames)
-    print(f"[merge] done in {_fmt(time.monotonic() - t_merge)} "
-          f"({total_episodes} episodes, {total_frames} frames)")
-
-
 def convert_dataset(
     repo_id: str,
     branch: str | None = None,
@@ -746,7 +575,6 @@ def convert_dataset(
     chunk_range: tuple[int, int] | None = None,
     push_to_hub: bool = True,
     force_conversion: bool = False,
-    num_workers: int = 1,
 ):
     if data_file_size_in_mb is None:
         data_file_size_in_mb = DEFAULT_DATA_FILE_SIZE_IN_MB
@@ -792,20 +620,8 @@ def convert_dataset(
                     f"Output path already exists: {new_root}. "
                     "Remove it or pass --overwrite-output."
                 )
-            # Preserve _parallel_tmp for resume; only clean final output
-            tmp_dir = new_root / "_parallel_tmp"
-            has_tmp = tmp_dir.exists()
-            if has_tmp:
-                # Move tmp out before cleaning
-                stash = new_root.parent / f".{new_root.name}_parallel_stash"
-                shutil.move(str(tmp_dir), str(stash))
-            shutil.rmtree(new_root, ignore_errors=True)
-            try:
-                new_root.mkdir(parents=True, exist_ok=True)
-            except FileExistsError:
-                pass
-            if has_tmp:
-                shutil.move(str(stash), str(tmp_dir))
+            shutil.rmtree(new_root)
+        new_root.mkdir(parents=True, exist_ok=True)
         print(f"Writing v3.0 dataset to {new_root} (leaving {root} unchanged).")
     else:
         old_root = root.parent / f"{root.name}_old"
@@ -828,6 +644,7 @@ def convert_dataset(
         )
 
     t_total = time.monotonic()
+
     step_times: list[tuple[str, float]] = []
 
     t0 = time.monotonic()
@@ -835,98 +652,22 @@ def convert_dataset(
     convert_tasks(root, new_root)
     step_times.append(("info + tasks", time.monotonic() - t0))
 
-    if num_workers != 1:
-        source_chunks = sorted({
-            int(p.name.removeprefix("chunk-"))
-            for p in (root / "data").iterdir()
-            if p.is_dir() and p.name.startswith("chunk-")
-        })
-        if chunk_range is not None:
-            lo, hi = chunk_range
-            source_chunks = [c for c in source_chunks if lo <= c <= hi]
-        if num_workers == 0:
-            num_workers = len(source_chunks)
-        num_workers = min(num_workers, len(source_chunks))
+    t0 = time.monotonic()
+    episodes_metadata = convert_data(root, new_root, data_file_size_in_mb, chunk_range=chunk_range)
+    step_times.append(("data conversion", time.monotonic() - t0))
 
-    if num_workers > 1:
-        tmp_base = new_root / "_parallel_tmp"
-        if overwrite_output and tmp_base.exists():
-            shutil.rmtree(tmp_base, ignore_errors=True)
-        try:
-            tmp_base.mkdir(parents=True, exist_ok=True)
-        except FileExistsError:
-            pass
+    if chunk_range is not None:
+        total_episodes = len(episodes_metadata)
+        total_frames = episodes_metadata[-1]["dataset_to_index"] if episodes_metadata else 0
+        patch_info_dataset_totals(new_root, total_episodes, total_frames)
 
-        # Count cached chunks for resume reporting
-        cached_count = sum(
-            1 for c in source_chunks
-            if (tmp_base / f"chunk_{c:03d}" / _DONE_MARKER).exists()
-        )
+    t0 = time.monotonic()
+    episodes_videos_metadata = convert_videos(root, new_root, video_file_size_in_mb, chunk_range=chunk_range)
+    step_times.append(("video conversion", time.monotonic() - t0))
 
-        worker_args = [
-            (str(root), str(tmp_base / f"chunk_{c:03d}"), c,
-             data_file_size_in_mb, video_file_size_in_mb)
-            for c in source_chunks
-        ]
-
-        if cached_count > 0:
-            print(f"[step] resuming: {cached_count}/{len(source_chunks)} chunks already done")
-        print(f"[step] parallel conversion: {num_workers} workers, {len(source_chunks)} chunks")
-        t0 = time.monotonic()
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = {
-                executor.submit(_convert_single_chunk_worker, a): a
-                for a in worker_args
-            }
-            results = []
-            for future in tqdm.tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(futures),
-                desc="parallel chunks",
-            ):
-                results.append(future.result())
-
-        t_conv = time.monotonic() - t0
-        slowest = max(r["elapsed"] for r in results)
-        step_times.append((
-            f"parallel conversion ({num_workers}w, slowest {_fmt(slowest)})", t_conv,
-        ))
-
-        # Clean previous merge output (data + videos) before re-merging
-        for d in ("data", "videos"):
-            p = new_root / d
-            if p.exists():
-                shutil.rmtree(p, ignore_errors=True)
-
-        t0 = time.monotonic()
-        _merge_parallel_results(root, new_root, results)
-        step_times.append(("merge", time.monotonic() - t0))
-        shutil.rmtree(tmp_base, ignore_errors=True)
-    else:
-        t0 = time.monotonic()
-        episodes_metadata = convert_data(
-            root, new_root, data_file_size_in_mb, chunk_range=chunk_range,
-        )
-        step_times.append(("data conversion", time.monotonic() - t0))
-
-        if chunk_range is not None:
-            total_episodes = len(episodes_metadata)
-            total_frames = (
-                episodes_metadata[-1]["dataset_to_index"] if episodes_metadata else 0
-            )
-            patch_info_dataset_totals(new_root, total_episodes, total_frames)
-
-        t0 = time.monotonic()
-        episodes_videos_metadata = convert_videos(
-            root, new_root, video_file_size_in_mb, chunk_range=chunk_range,
-        )
-        step_times.append(("video conversion", time.monotonic() - t0))
-
-        t0 = time.monotonic()
-        convert_episodes_metadata(
-            root, new_root, episodes_metadata, episodes_videos_metadata,
-        )
-        step_times.append(("episodes metadata", time.monotonic() - t0))
+    t0 = time.monotonic()
+    convert_episodes_metadata(root, new_root, episodes_metadata, episodes_videos_metadata)
+    step_times.append(("episodes metadata", time.monotonic() - t0))
 
     total_elapsed = time.monotonic() - t_total
     col = max(len(s) for s, _ in step_times)
@@ -1031,15 +772,6 @@ if __name__ == "__main__":
             "Only convert v2.1 source folders chunk-START through chunk-END (inclusive), "
             "e.g. `0 10` processes data under chunk-000 … chunk-010. "
             "Updates info.json totals for this subset."
-        ),
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=1,
-        help=(
-            "Parallel workers for chunk conversion. "
-            "0 = auto (one worker per source chunk), 1 = sequential (default)."
         ),
     )
 

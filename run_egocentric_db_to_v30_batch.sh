@@ -15,26 +15,26 @@
 {
 
 PREFIX=${1:-"subset"}
-MAX_PARALLEL=${2:-32}
+MAX_PARALLEL=${2:-64}
 
 # ── user config ───────────────────────────────────────────────────────────────
 # Defaults tuned for the host: 384 cores, 4×RTX 5880 Ada, ~42 GB local scratch.
 # Single-subset peak ≈ (clips_per_subset × 3.3 MB).  With NUM_SUBSETS=256 each
 # subset is ≈ 930 ep ≈ 3 GB; 12 parallel → ~36 GB local peak (safe under 42 GB).
-PARTITION=${PARTITION:-Ego4D}                # or Egocentric-100K
-NUM_SUBSETS=${NUM_SUBSETS:-512}              # how many path-range pieces to cut
+PARTITION=${PARTITION:-Egocentric-100K}                # or Egocentric-100K
+NUM_SUBSETS=${NUM_SUBSETS:-4096}              # how many path-range pieces to cut
 VCODEC=${VCODEC:-h264_nvenc}
 GPU_COUNT=${GPU_COUNT:-4}                    # NVENC sessions are unlimited on 5880 Ada
-PREPROCESS_WORKERS=${PREPROCESS_WORKERS:-3}
-MAX_PREPARED_IN_FLIGHT=${MAX_PREPARED_IN_FLIGHT:-6}
+PREPROCESS_WORKERS=${PREPROCESS_WORKERS:-6}
+MAX_PREPARED_IN_FLIGHT=${MAX_PREPARED_IN_FLIGHT:-12}
 PAGE_SIZE=${PAGE_SIZE:-500}
 OVERWRITE=${OVERWRITE:-false}
 REDIRECT_LOG=${REDIRECT_LOG:-true}
 # Multi-machine sharding: each shard processes subsets where i % NUM_SHARDS == SHARD.
 # All shards must use the same NUM_SUBSETS / PARTITION / DST_ROOT (so that subset_NNNN
 # names line up across machines and outputs naturally merge into one DST_ROOT).
-SHARD=${SHARD:-0}
-NUM_SHARDS=${NUM_SHARDS:-1}
+SHARD=${SHARD:-2}
+NUM_SHARDS=${NUM_SHARDS:-6}
 # ─────────────────────────────────────────────────────────────────────────────
 
 if (( SHARD < 0 || SHARD >= NUM_SHARDS )); then
@@ -158,6 +158,7 @@ LOGS=()
 FAILED=()
 SKIP_COUNT=0
 DONE_COUNT=0
+LAUNCH_COUNT=0
 LAST_STATUS=$(date +%s)
 
 _cleanup() {
@@ -218,7 +219,8 @@ for ((i=0; i<TOTAL; i++)); do
 
     PATH_GTE="${BOUNDARIES[$i]}"
     PATH_LT="${BOUNDARIES[$i+1]}"
-    GPU=$(( i % GPU_COUNT ))
+    GPU=$(( LAUNCH_COUNT % GPU_COUNT ))
+    LAUNCH_COUNT=$(( LAUNCH_COUNT + 1 ))
     LOG="${LOG_DIR}/${SUBSET_NAME}.log"
 
     OVERWRITE_FLAG=(); [[ "${OVERWRITE}" == "true" ]] && OVERWRITE_FLAG=(--overwrite)

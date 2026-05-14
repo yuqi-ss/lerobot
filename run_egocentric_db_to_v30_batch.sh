@@ -33,8 +33,8 @@ REDIRECT_LOG=${REDIRECT_LOG:-true}
 # Multi-machine sharding: each shard processes subsets where i % NUM_SHARDS == SHARD.
 # All shards must use the same NUM_SUBSETS / PARTITION / DST_ROOT (so that subset_NNNN
 # names line up across machines and outputs naturally merge into one DST_ROOT).
-SHARD=${SHARD:-2}
-NUM_SHARDS=${NUM_SHARDS:-6}
+SHARD=${SHARD:-6}
+NUM_SHARDS=${NUM_SHARDS:-8}
 # ─────────────────────────────────────────────────────────────────────────────
 
 if (( SHARD < 0 || SHARD >= NUM_SHARDS )); then
